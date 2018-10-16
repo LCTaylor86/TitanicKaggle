@@ -1,0 +1,170 @@
+
+ggplot(all[all$Age<14.5 & !is.na(all$Survived),], aes(x=Pclass, fill=Survived))+
+        geom_bar(stat='count') + theme_grey(base_size = 18)
+
+all$IsChildP12 <- 'No'
+all$IsChildP12[all$Age<=14.5 & all$Pclass %in% c('1', '2')] <- 'Yes'
+all$IsChildP12 <- as.factor(all$IsChildP12)
+
+d1 <- ggplot(all[!is.na(all$Survived),], aes(x = Embarked, fill = Survived)) +
+  geom_bar(stat='count') + theme_grey() + labs(x = 'Embarked', y= 'Count')
+d2 <- ggplot(all[!is.na(all$Survived),], aes(x = Embarked, fill = Survived)) +
+  geom_bar(stat='count', position= 'fill') + theme_grey() + labs(x = 'Embarked', y= 'Percent')
+
+grid.arrange(d1, d2, nrow=1)
+
+ggplot(all[indexAgeSurvivedNotNA,], aes(x = Age, fill = Survived)) +
+geom_histogram(aes(fill=factor(Survived))) + labs(title="Survival density, known-ages, and Embarked") +
+scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) + theme_grey() + facet_grid(.~Embarked)
+
+tab1 <- rbind(table(all$Embarked[!is.na(all$Survived)]),table(all$Embarked[indexAgeSurvivedNotNA]))
+tab1 <- cbind(tab1, (rowSums(tab1)))
+tab1 <- rbind(tab1, tab1[1,]-tab1[2,])
+tab1 <- rbind(tab1, round((tab1[3,]/tab1[1,])*100))
+rownames(tab1) <- c("All", "With Age", "Missing Age", "Percent Missing")
+colnames(tab1) <- c("C", "Q", "S", "Total")
+kable(tab1)
+
+TicketSurvivors <- all %>%
+        group_by(Ticket) %>%
+        summarize(Tsize = length(Survived),
+                  NumNA = sum(is.na(Survived)),
+                  SumSurvived = sum(as.numeric(Survived)-1, na.rm=T))
+
+all <- left_join(all, TicketSurvivors)
+all$AnySurvivors[all$Tsize==1] <- 'other'
+all$AnySurvivors[all$Tsize>=2] <- ifelse(all$SumSurvived[all$Tsize>=2]>=1, 'survivors in group', 'other')
+all$AnySurvivors <- as.factor(all$AnySurvivors)
+
+kable(x=table(all$AnySurvivors), col.names= c('AnySurvivors', 'Frequency'))
+
+all$IsSolo[all$SibSp==0] <- 'Yes'
+all$IsSolo[all$SibSp!=0] <- 'No'
+all$IsSolo <- as.factor(all$IsSolo)
+
+ggplot(all[!is.na(all$Survived),], aes(x = IsSolo, fill = Survived)) +
+  geom_bar(stat='count') + theme_grey(base_size = 18)
+
+#cleaning up
+all$PassengerId <- NULL
+all$SibSp <- NULL
+all$Parch <- NULL
+all$Ticket <- NULL
+all$Fare <- NULL
+all$Cabin <- NULL
+all$Surname <- NULL
+all$Fsize <- NULL
+all$FsizeName <- NULL
+all$Favg <- NULL
+all$Tsize <- NULL
+#all$Group <- NULL
+all$Ticket2 <- NULL
+all$AgeLM <- NULL
+all$Child <- NULL
+all$HasParch <- NULL
+all$MedianFarePP <- NULL
+rm(tab1); rm(tab2); rm(tab3); rm(AgeLM); rm(c1); rm(d1); rm(d2);
+
+#splitting data into train and test set again
+trainClean <- all[!is.na(all$Survived),]
+testClean <- all[is.na(all$Survived),]
+
+set.seed(2017)
+caret_matrix <- train(x=trainClean[,c('PclassSex', 'GroupSize', 'FarePP', 'AnySurvivors', 'IsChildP12')], y=trainClean$Survived, data=trainClean, method='rf', trControl=trainControl(method="cv", number=5))
+caret_matrix
+caret_matrix$results
+
+#extracting variable importance and make graph with ggplot (looks nicer that the standard varImpPlot)
+rf_imp <- varImp(caret_matrix, scale = FALSE)
+rf_imp <- rf_imp$importance
+rf_gini <- data.frame(Variables = row.names(rf_imp), MeanDecreaseGini = rf_imp$Overall)
+
+ggplot(rf_gini, aes(x=reorder(Variables, MeanDecreaseGini), y=MeanDecreaseGini, fill=MeanDecreaseGini)) +
+        geom_bar(stat='identity') + coord_flip() + theme(legend.position="none") + labs(x="") +
+        ggtitle('Variable Importance Random Forest') + theme(plot.title = element_text(hjust = 0.5))
+
+#using the model to make Survival predictions on the test set
+solution_rf <- predict(caret_matrix, testClean)
+
+set.seed(2017)
+caret_svm <- train(Survived~ PclassSex + FarePP + AnySurvivors + IsChildP12 + IsSolo, data=trainClean, method='svmRadial', preProcess= c('center', 'scale'), trControl=trainControl(method="cv", number=5))
+caret_svm
+caret_svm$results
+
+#using the model to make Survival predictions on the test set
+solution_svm <- predict(caret_svm, testClean)
+
+set.seed(2017)
+caret_boost <- train(Survived~ PclassSex + GroupSize + FareBins + AnySurvivors + IsChildP12, data=trainClean, method='gbm', preProcess= c('center', 'scale'), trControl=trainControl(method="cv", number=7), verbose=FALSE)
+print(caret_boost)
+
+#using the model to make Survival predictions on the test set
+solution_boost <- predict(caret_boost, testClean)
+
+#adding model predictions to test dataframe
+testClean$RF <- as.numeric(solution_rf)-1
+testClean$SVM <- as.numeric(solution_svm)-1
+testClean$Boost <- as.numeric(solution_boost)-1
+
+#compose correlations plot
+corrplot.mixed(cor(testClean[, c('RF', 'SVM', 'Boost')]), order="hclust", tl.col="black")
+
+
+testClean$Sum <- testClean$RF + testClean$SVM + testClean$Boost
+testClean$Majority <- ifelse(testClean$Sum<=1, 0, 1)
+
+testClean$DisagreeSVM <- ifelse(testClean$RF==testClean$Boost & testClean$SVM != testClean$RF, testClean$RF, testClean$SVM)
+
+#predictions of the models on the training set
+trainClean$RF <- predict(caret_matrix, trainClean)
+trainClean$SVM <- predict(caret_svm, trainClean)
+trainClean$Boost <- predict(caret_boost, trainClean)
+
+
+#plot differences between actual survived and predictions
+f1 <- ggplot(trainClean[trainClean$Survived != trainClean$RF,], aes(x=PclassSex, fill=RF)) +
+        geom_bar(stat='count') + labs(title="FP and FN, RF model") + theme_grey() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(legend.position="none") + xlab("")
+
+f2 <- ggplot(trainClean[trainClean$Survived != trainClean$SVM,], aes(x=PclassSex, fill=SVM)) +
+        geom_bar(stat='count')+ labs(title="FP and FN, SVM") + theme_grey() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(legend.position="none") + xlab("")
+
+f3 <- ggplot(trainClean[trainClean$Survived != trainClean$Boost,], aes(x=PclassSex, fill=Boost)) +
+        geom_bar(stat='count')+ labs(title="FP and FN, GBM") + theme_grey() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        theme(legend.position="none") + xlab("")
+
+grid.arrange(f1, f2, f3, nrow = 1)
+
+#selecting SVM prediction, and GMB predictions for P3
+testClean$Select <- ifelse(testClean$Pclass != 3, testClean$SVM, testClean$Boost)
+
+#writing final submission file
+submission_select <- data.frame(PassengerId = test$PassengerId, Survived = testClean$Select)
+write.csv(submission_select, file = 'Titanic_select.csv', row.names = F)
+
+cat('Total number of Male passengers in P1 in the test set is', length(testClean$Survived[testClean$PclassSex=='P1Male']))
+
+p1m_surv <- as.data.frame(sapply(testClean[testClean$PclassSex=='P1Male', c('RF', 'SVM', 'Boost')], function(x) {sum(x)}))
+kable(x=p1m_surv, col.names = c('Predicted number of survivors'))
+
+p1m1 <- ggplot(all[indexAgeSurvivedNotNA,] %>% filter(PclassSex=='P1Male'), aes(x = Age, fill = Survived)) + geom_density(alpha=0.5, aes(fill=factor(Survived))) + labs(title="Survival density and Age P1 Male") + theme_grey()
+
+all$P1AgeMale[indexAgeSurvivedNotNA=T & all$PclassSex=='P1Male' & all$Age<40] <- 'Under40'
+all$P1AgeMale[indexAgeSurvivedNotNA=T & all$PclassSex=='P1Male' & all$Age>=40] <- 'Over40'
+
+p1m2 <- ggplot(all[!is.na(all$Survived) & !is.na(all$P1AgeMale),], aes(x=P1AgeMale, fill=Survived))+
+        geom_bar(stat = 'count', position = 'fill') + theme(legend.position="none")
+
+
+grid.arrange(p1m1, p1m2, widths=c(2,1))
+
+
+ggplot(all[!is.na(all$Survived),], aes(x=IsSolo, fill=Survived))+
+        geom_bar(stat='count', position='fill') + facet_grid(.~Pclass+Sex)
+
+
+
